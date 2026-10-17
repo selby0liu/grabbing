@@ -1,0 +1,778 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+10/16 开售守夜脚本 —— 脚本替你刷 Safari，刷到能买了就停手叫你
+
+用法：
+    python3 launch_watch.py --test              自检：响铃、置顶、Bark 都通不通
+    python3 launch_watch.py --windows           三个窗口并排摆好，开始全速刷
+    python3 launch_watch.py --windows --start 19:58    先待命，到点自动转全速
+
+最重要的一条规矩：**全程只抢一次焦点。**
+    第一个有货的页面会被切到你面前。之后不管别的页面出什么动静，
+    脚本都不会再动窗口、不会再切标签页——你正在下单，谁也不许打断你。
+    后面的动静只靠声音和通知告诉你，每个页面声音不一样，不用看就知道是哪个。
+
+其它规矩：
+    · 一个页面一旦读到能买了，就被冻结，脚本再也不刷它——免得把你正在操作的页面刷掉。
+    · 其余页面继续刷，但从此静默，不抢焦点。
+    · 维护页要一直刷下去，不算「能买了」。
+    · 脚本绝不替你点任何按钮、绝不填任何信息。下单永远是你自己点。
+    · 响铃期间按一下回车就静音，脚本继续盯别的页面。
+
+两个已经踩过的坑（改代码前先看 memory 里的 safari-applescript-gotchas）：
+    · 刷新后头 0.5 秒页面没渲染完，这时候读出来像是「预购提示消失了」。
+    · AppleScript 在同一个 tell 块里连着读 text of tab 会全读成空，必须一次一个进程。
+"""
+
+import argparse
+import datetime as dt
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+
+SHOP = "https://www.apple.com.cn/shop/buy-iphone/iphone-duo"
+
+HOME_URL = "https://www.apple.com.cn/"   # 只给 --setup 开在左边给你用，脚本从不盯它
+
+TARGETS = [
+    # every = 每几轮查一次。查一个页面约 1 秒，不能三个都每轮查，否则每个页面轮到的间隔太长。
+    {"key": "white", "label": "星光白 512GB", "url": SHOP + "/mk2p4ch/a",
+     "match": "mk2p4ch", "exclude": None, "sound": "Glass",     "buyable": True, "every": 1},
+    {"key": "black", "label": "夜空色 512GB", "url": SHOP + "/mk2q4ch/a",
+     "match": "mk2q4ch", "exclude": None, "sound": "Submarine", "buyable": True, "every": 2},
+    # 配置页。深链接（上面两个）万一在预购时打不开或被跳走，它是最可能还活着的退路。
+    # 2026-09-25 实测它身上有「iPhone Duo」「17,999」「机型将在获得批准后发售」，
+    # 身份和待售提示都齐，能正经参与判断，不是摆设。
+    {"key": "shop",  "label": "配置页",       "url": SHOP,
+     "match": "buy-iphone/iphone-duo", "exclude": "mk2", "sound": "Tink",
+     "buyable": True, "every": 3, "optional": True},
+]
+
+# 出现型信号：只会多出来，不会因页面没加载完而凭空出现，所以看到就能立刻信。
+BUY_MARKERS = ["加入购物袋", "立即购买"]
+
+# 消失型信号：2026-09-25 拿「能买的 iPhone 17 页面」对照测出来的。
+# duo 现在这两句都有，iPhone 17 一句都没有——它们消失才是真正可靠的「能买了」。
+# 为什么不能只靠「加入购物袋」：实测连能买的 iPhone 17 页面都没有这四个字
+# （要选完颜色容量按钮才出现），指望它当晚一定出现是在赌。
+GONE_MARKERS = ["暂无供应", "机型将在获得批准后发售"]
+
+# 身份标记：用来确认「这还是那个商品页」。维护页上这两个都没有。
+# 没有这道验证的话，苹果一挂维护页，「待售提示全消失」就成立了，
+# 脚本会误报「能买了」并把页面冻结——正好在最要命的时刻停止刷新。
+PRODUCT_MARKERS = ["iPhone Duo", "17,999"]
+
+# 网址里出现这些，说明是你自己往下走了（进购物袋/结账/登录），脚本就撒手不管。
+# 除此之外的网址漂移（比如苹果维护时重定向走），脚本会把标签页拉回目标网址。
+HANDOVER_HINTS = ["/bag", "checkout", "signin", "/account", "/order"]
+
+SOUND_DIR = "/System/Library/Sounds/%s.aiff"
+
+# 实测：Safari 窗口宽度 ≥1120px 苹果页面才是桌面版布局，1040px 就缩成手机版。
+# 注意这是【窗口】宽度，如果开着阅读列表侧边栏（约 180px），还要再加上去。
+DESKTOP_MIN_WIDTH = 1120
+
+# 首页窗口宽度。给到桌面版布局的下限就好——再窄它自己不好用（600px 时页面缩成手机版），
+# 再宽就是浪费商品窗口的空间。三个窗口都卡在「刚好够用」，多出来的全给商品。
+HOME_WIDTH = DESKTOP_MIN_WIDTH
+
+RENDER_FLOOR = 3000      # 字数低于这个就认为还没渲染完
+SETTLE_TOLERANCE = 0.03  # 两次读数相差小于 3% 算稳定
+SETTLE_TIMEOUT = 8.0
+POLL_STEP = 0.3
+RING_SECONDS = 120.0
+
+MAC_CFG = os.path.expanduser(
+    "~/Library/Application Support/iPhoneDuoMonitor/config/config.json")
+
+
+# ---------- AppleScript 基础件 ----------
+
+def osa(script, timeout=25, tries=2):
+    """跑一段 AppleScript。每次都起独立进程——这是故意的，见文件头。
+    Safari 正忙着加载时会不理 AppleScript，所以瞬时失败要重试，
+    否则会被上层误判成「标签页不见了」，进而重复开新标签页。"""
+    for i in range(tries):
+        try:
+            p = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=timeout)
+            if p.returncode == 0:
+                return p.stdout.strip()
+        except Exception:
+            pass
+        if i + 1 < tries:
+            time.sleep(0.4)
+    return None
+
+
+def find_tab(match, exclude=None):
+    """按 URL 关键字找标签页，返回 (窗口号, 标签号)。"""
+    cond = 'if u contains "%s"' % match
+    if exclude:
+        cond += ' and u does not contain "%s"' % exclude
+    out = osa('''
+tell application "Safari"
+  set wi to 0
+  repeat with w in windows
+    set wi to wi + 1
+    set ti to 0
+    repeat with t in tabs of w
+      set ti to ti + 1
+      try
+        set u to ((URL of t) as string)
+        %s then
+          return (wi as string) & "," & (ti as string)
+        end if
+      end try
+    end repeat
+  end repeat
+  return "NONE"
+end tell''' % cond)
+    if not out or out == "NONE":
+        return None
+    try:
+        a, b = out.split(",")
+        return int(a), int(b)
+    except Exception:
+        return None
+
+
+def open_tab(url, own_window):
+    if own_window:
+        osa('tell application "Safari" to make new document with properties {URL:"%s"}' % url)
+    else:
+        osa('''
+tell application "Safari"
+  if (count of windows) = 0 then
+    make new document with properties {URL:"%s"}
+  else
+    make new tab at end of tabs of window 1 with properties {URL:"%s"}
+  end if
+end tell''' % (url, url))
+
+
+def read_tab(wi, ti):
+    out = osa('''
+tell application "Safari"
+  set t to tab %d of window %d
+  set s to (text of t) as string
+  set n to (count of characters of s) as string
+  set b1 to (s contains "加入购物袋") as string
+  set b2 to (s contains "立即购买") as string
+  set g1 to (s contains "暂无供应") as string
+  set g2 to (s contains "机型将在获得批准后发售") as string
+  set p1 to (s contains "iPhone Duo") as string
+  set p2 to (s contains "17,999") as string
+  return n & "|" & b1 & "|" & b2 & "|" & g1 & "|" & g2 & "|" & p1 & "|" & p2 & "|" & ((URL of t) as string)
+end tell''' % (ti, wi))
+    if not out or "|" not in out:
+        return None
+    f = out.split("|")
+    if len(f) < 8:
+        return None
+    try:
+        n = int(f[0])
+    except Exception:
+        return None
+    return {"chars": n,
+            "buy": (f[1] == "true" or f[2] == "true"),
+            "pending": (f[3] == "true" or f[4] == "true"),  # 待售提示还在
+            "prod": (f[5] == "true" and f[6] == "true"),    # 还是那个商品页
+            "url": f[7]}
+
+
+def reload_tab(wi, ti):
+    osa('tell application "Safari" to set URL of tab %d of window %d '
+        'to (URL of tab %d of window %d)' % (ti, wi, ti, wi))
+
+
+def bring_front(wi, ti):
+    osa('''
+tell application "Safari"
+  activate
+  set current tab of window %d to tab %d of window %d
+  set index of window %d to 1
+end tell''' % (wi, ti, wi, wi))
+
+
+def usable_frame():
+    """真正能用的屏幕区域（避开菜单栏和程序坞）。
+
+    Finder 报的是整块屏幕（含程序坞底下那块），照它摆窗口，
+    底下那个会被程序坞压住点不到。办法是：故意把某个窗口设成远超屏幕的尺寸，
+    Safari 会自己把它压回合法范围，读回来就是答案。
+    实测这台机器：Finder 说 0,0,2560,1440，Safari 压回 y 30→1350（顶 30 底 90）。
+    横向 Safari 不管，得自己按 Finder 的值夹住。
+    """
+    b = osa('tell application "Finder" to get bounds of window of desktop')
+    try:
+        fx0, fy0, fx1, fy1 = [int(v.strip()) for v in b.split(",")]
+    except Exception:
+        return None
+    n = osa('tell application "Safari" to count of windows')
+    try:
+        if int(n or 0) < 1:
+            return (fx0, fy0 + 25, fx1, fy1 - 100)   # 没窗口可试探，按经验留边
+    except Exception:
+        return (fx0, fy0 + 25, fx1, fy1 - 100)
+    keep = osa('tell application "Safari" to get bounds of window 1')
+    osa('tell application "Safari" to set bounds of window 1 to {%d, %d, %d, %d}'
+        % (fx0 - 200, fy0 - 200, fx1 + 1000, fy1 + 1000))
+    got = osa('tell application "Safari" to get bounds of window 1')
+    if keep:
+        osa('tell application "Safari" to set bounds of window 1 to {%s}' % keep)
+    try:
+        _, uy0, _, uy1 = [int(v.strip()) for v in got.split(",")]
+        return (fx0, uy0, fx1, uy1)
+    except Exception:
+        return (fx0, fy0 + 25, fx1, fy1 - 100)
+
+
+def maximize_window(wi):
+    """把窗口撑到整个屏幕。有货的那一刻自动调用——
+    你不用再手忙脚乱拖窗口，直接下单。"""
+    f = usable_frame()
+    if not f:
+        return False
+    osa('tell application "Safari" to set bounds of window %d to {%d, %d, %d, %d}'
+        % (wi, f[0], f[1], f[2], f[3]))
+    return True
+
+
+def tile_windows(order):
+    """把 order 里的窗口号从左到右并排摆满屏幕。"""
+    b = osa('tell application "Finder" to get bounds of window of desktop')
+    try:
+        x0, y0, x1, y1 = [int(v.strip()) for v in b.split(",")]
+    except Exception:
+        return False
+    top = y0 + 25                      # 让开菜单栏
+    n = len(order)
+    if n == 0:
+        return False
+    w = (x1 - x0) // n
+    for i, wi in enumerate(order):
+        left = x0 + i * w
+        right = x1 if i == n - 1 else left + w
+        osa('tell application "Safari" to set bounds of window %d to {%d, %d, %d, %d}'
+            % (wi, left, top, right, y1))
+    return True
+
+
+# ---------- 响铃（后台线程，不挡主循环） ----------
+
+_ring_until = 0.0
+_ring_sound = SOUND_DIR % "Glass"
+_ring_lock = threading.Lock()
+
+
+def _ring_worker():
+    while True:
+        with _ring_lock:
+            until, snd = _ring_until, _ring_sound
+        if time.time() < until:
+            subprocess.run(["afplay", snd], capture_output=True)
+            time.sleep(0.2)
+        else:
+            time.sleep(0.3)
+
+
+def start_ring(sound_name, seconds=RING_SECONDS):
+    global _ring_until, _ring_sound
+    with _ring_lock:
+        _ring_sound = SOUND_DIR % sound_name
+        _ring_until = max(_ring_until, time.time() + seconds)
+
+
+def stop_ring():
+    global _ring_until
+    with _ring_lock:
+        _ring_until = 0.0
+
+
+def _stdin_worker():
+    try:
+        for _ in sys.stdin:
+            stop_ring()
+            print("\n已静音。脚本还在盯别的页面。")
+    except Exception:
+        pass
+
+
+# ---------- 判断 ----------
+
+def probe(wi, ti):
+    """刷新之后立刻看，返回 (结论, 读数)。这是整个脚本的判断核心。
+
+    关键在于分清两类信号：
+      「存在」型 —— 页面没加载完只会少字，不会凭空多出字。所以看到就能立刻下结论，
+                    一秒都不用等。「加入购物袋」和「暂无供应」都属于这类。
+      「消失」型 —— 半成品页面会冒充「某句话没了」，所以必须等页面稳定下来才能算数。
+
+    四种结论：
+      HIT     商品页 + 出现「加入购物袋」 → 能买了，立刻信
+      PENDING 「暂无供应」这类待售提示还在 → 肯定还没开卖，立刻返回去再刷（不等）
+      MAYBE   还是商品页，但待售提示都没了 → 可能开卖了，交给上层再刷一次复核
+      OTHER   压根不是商品页（维护页、加载失败等）→ 继续刷，绝不当成开卖
+    """
+    t0 = time.time()
+    prev, same, last = None, 0, None
+    while time.time() - t0 < SETTLE_TIMEOUT:
+        r = read_tab(wi, ti)
+        if r is None:
+            time.sleep(POLL_STEP)
+            continue
+        last = r
+
+        # ——「存在」型：立刻下结论，不等 ——
+        if r["prod"] and r["buy"]:
+            return "HIT", r
+        if r["pending"]:
+            return "PENDING", r      # 还是待售 → 马上回去再刷
+
+        # —— 剩下的都含糊：维护页？没加载完？还是真开卖了？必须等稳定 ——
+        if prev is not None and prev > 0:
+            drift = abs(r["chars"] - prev) / float(prev)
+            same = same + 1 if drift < SETTLE_TOLERANCE else 0
+            # 加载途中字数只涨不跌，中途会短暂平一下（实测在 4575 字平过），
+            # 所以长页面要连稳 2 次，短页面（维护页）要连稳 3 次。
+            need = 2 if r["chars"] >= RENDER_FLOOR else 3
+            if r["chars"] > 0 and same >= need:
+                return ("MAYBE" if r["prod"] else "OTHER"), r
+        prev = r["chars"]
+        time.sleep(POLL_STEP)
+
+    # 超时了什么都没确认。保守起见当成 OTHER，下一轮再看，绝不误报开卖。
+    return "OTHER", last
+
+
+def push_bark(title, body):
+    try:
+        cfg = json.load(open(MAC_CFG, encoding="utf-8"))
+        b = cfg.get("notification", {}).get("bark", {})
+        if not b.get("enabled") or not b.get("url"):
+            return False
+        url = b["url"].rstrip("/") + "/" + urllib.parse.quote(title) + \
+            "/" + urllib.parse.quote(body) + "?level=critical&sound=alarm"
+        urllib.request.urlopen(url, timeout=6).read()
+        return True
+    except Exception:
+        return False
+
+
+def notify(title, body):
+    osa('display notification "%s" with title "%s"'
+        % (body.replace('"', "'"), title.replace('"', "'")))
+
+
+# ---------- 报警：全程只抢一次焦点 ----------
+
+_fronted = False
+
+
+def announce(tg, pos, headline, is_hit, allow_front):
+    """出动静了。第一次（且只有第一次）把页面切到眼前，之后一律只出声不动窗口。"""
+    global _fronted
+    line = "%s %s" % (tg["label"], headline)
+    print("\n" + ("=" * 64 if is_hit else "-" * 64))
+    print(("★ " if is_hit else "· ") + line)
+    if is_hit and allow_front and not _fronted:
+        _fronted = True
+        big = maximize_window(pos[0])
+        bring_front(*pos)
+        print("  已切到你面前%s。从现在起我不会再动任何窗口，不会打断你下单。"
+              % ("，并且撑满全屏了" if big else ""))
+    elif is_hit:
+        # 这时候你多半正在第一个窗口里下单，放大第二个窗口会盖住你，所以什么都不动。
+        print("  没抢焦点、也没动窗口（你可能正在买别的）。"
+              "声音是「%s」，忙完自己瞄一眼那个窗口。" % tg["sound"])
+    notify("Duo 开卖了" if is_hit else "Duo 页面有动静", line)
+    push_bark("Duo 开卖了" if is_hit else "Duo 页面有动静", line)
+    start_ring(tg["sound"])
+    print("  响铃中，按回车静音。")
+
+
+# ---------- 开售前：一键摆好窗口 ----------
+
+def close_target_tabs():
+    """只关掉我们自己那三个网址的标签页，别的一律不动。"""
+    for tg in TARGETS:
+        ex = tg["exclude"]
+        cond = 'u contains "%s"' % tg["match"]
+        if ex:
+            cond += ' and u does not contain "%s"' % ex
+        osa('''
+tell application "Safari"
+  repeat with wi from (count of windows) to 1 by -1
+    set w to window wi
+    repeat with ti from (count of tabs of w) to 1 by -1
+      set t to tab ti of w
+      try
+        set u to ((URL of t) as string)
+        if %s then close t
+      end try
+    end repeat
+  end repeat
+end tell''' % cond)
+        time.sleep(0.3)
+
+
+def setup_windows(targets, home_width=HOME_WIDTH):
+    """在你自己开好的首页窗口旁边，为每个商品拉起一个**独立窗口**并排摆好。
+
+    首页窗口完全不碰——不移动、不改大小、不刷新。脚本只管它旁边那几个。
+    找不到首页窗口就默认用屏幕右半边。
+    """
+    print("清掉旧的商品标签页（只关这几个网址，首页不动）……")
+    close_target_tabs()
+
+    f = usable_frame()
+    if f:
+        sx0, sy0, sx1, sy1 = f
+        print("可用屏幕区域 %d×%d（已避开菜单栏和程序坞）" % (sx1 - sx0, sy1 - sy0))
+    else:
+        print("读不到屏幕尺寸，窗口只开不摆，你自己拖。")
+        sx0 = sy0 = sx1 = sy1 = None
+
+    # 首页压成左边一条窄的（它只是救急入口，不用占半个屏），
+    # 剩下的全给商品窗口，好让它们都够宽。
+    area = None
+    hpos = find_tab("apple.com.cn", "shop")
+    if sx0 is not None:
+        if hpos:
+            hw = max(DESKTOP_MIN_WIDTH, min(home_width, (sx1 - sx0) - DESKTOP_MIN_WIDTH))
+            osa('tell application "Safari" to set bounds of window %d to {%d, %d, %d, %d}'
+                % (hpos[0], sx0, sy0, sx0 + hw, sy1))
+            area = (sx0 + hw, sx1)
+            print("首页窗口放左边 %d px（刚好够桌面版布局），剩下 %d px 全给商品窗口。"
+                  % (hw, sx1 - sx0 - hw))
+        else:
+            area = (sx0, sx1)
+            print("没找到首页窗口，整个屏幕都给商品窗口。")
+
+    opened = []
+    for tg in targets:
+        print("拉起独立窗口：%s" % tg["label"])
+        osa('tell application "Safari" to make new document with properties {URL:"%s"}' % tg["url"])
+        time.sleep(2.5)
+        pos = find_tab(tg["match"], tg["exclude"])
+        if pos:
+            opened.append((tg, pos[0]))
+        else:
+            print("  ! %s 没开起来" % tg["label"])
+
+    if area and opened:
+        x0, x1 = area
+        top = sy0
+        n = len(opened)
+        # 实测（2026-09-25）：Safari 窗口宽度要到 1120px，苹果页面才是桌面版布局，
+        # 1040px 就缩成手机版（导航栏变汉堡菜单）。横着排不下就竖着叠——
+        # 竖着叠每个窗口能占满整个宽度，反而看得清楚。
+        horizontal = (x1 - x0) >= n * DESKTOP_MIN_WIDTH
+        if horizontal:
+            w = (x1 - x0) // n
+            print("右边够宽（%d px），横着并排，每个 %d px。" % (x1 - x0, w))
+        else:
+            h = (sy1 - top) // n
+            print("右边只有 %d px，横着排每个不到 %d px 会缩成手机版布局，"
+                  "改成上下叠放——每个都占满 %d px 宽度，桌面版布局。"
+                  % (x1 - x0, DESKTOP_MIN_WIDTH, x1 - x0))
+        for i2, (tg, _stale) in enumerate(opened):
+            # 每开一个新窗口，所有窗口的序号都会往后挪一位，
+            # 所以刚才记下的序号到这里已经失效了，必须重新查。
+            cur = find_tab(tg["match"], tg["exclude"])
+            if not cur:
+                continue
+            if horizontal:
+                w = (x1 - x0) // n
+                left = x0 + i2 * w
+                right = x1 if i2 == n - 1 else left + w
+                b = (left, top, right, sy1)
+            else:
+                h = (sy1 - top) // n
+                t2 = top + i2 * h
+                b2 = sy1 if i2 == n - 1 else t2 + h
+                b = (x0, t2, x1, b2)
+            osa('tell application "Safari" to set bounds of window %d to {%d, %d, %d, %d}'
+                % (cur[0], b[0], b[1], b[2], b[3]))
+
+    print("")
+    if hpos:
+        print("  左边      苹果官网首页    ← 救急入口，脚本只摆它一次，不刷新它")
+    for tg, wi in opened:
+        print("  独立窗口  %-12s  ← 归脚本，提示音 %s" % (tg["label"], tg["sound"]))
+    print("")
+    print("就算现在页面全显示「我们马上回来」也没关系——")
+    print("脚本认的是地址栏里的网址，不是页面上写什么。")
+    return bool(opened)
+
+
+# ---------- 主流程 ----------
+
+def ensure_tabs(targets, own_windows):
+    def look(tg, tries=3):
+        for i in range(tries):
+            pos = find_tab(tg["match"], tg["exclude"])
+            if pos:
+                return pos
+            if i + 1 < tries:
+                time.sleep(0.8)
+        return None
+
+    ready = []
+    for tg in targets:
+        if look(tg) is None:                 # 连查三次都没有，才真的是没开
+            print("  打开 %s ……" % tg["label"])
+            open_tab(tg["url"], own_windows)
+            time.sleep(3.0)
+        if look(tg) is None:
+            print("  ! %s 打不开，跳过" % tg["label"])
+        else:
+            ready.append(tg)
+    return ready
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--interval", type=float, default=0.0,
+                    help="每轮额外停几秒；默认 0（刷新+渲染本身就要 2-4 秒）")
+    ap.add_argument("--start", default="",
+                    help="HH:MM；在这之前每分钟刷一次待命，到点自动转全速")
+    ap.add_argument("--windows", action="store_true",
+                    help="每个页面单独一个窗口，并排摆满屏幕")
+    ap.add_argument("--no-front", action="store_true",
+                    help="有货也不抢焦点，只出声（窗口已经并排摆好时可以用）")
+    ap.add_argument("--with-shop", action="store_true",
+                    help="多开一个配置页窗口当退路（深链接万一打不开时用）")
+    ap.add_argument("--max-minutes", type=float, default=180.0,
+                    help="全速开始后最多跑多少分钟就自动停，默认 180；填 0 表示不限")
+    ap.add_argument("--home-width", type=int, default=HOME_WIDTH,
+                    help="首页窗口压成多宽，默认 %d；调小商品窗口就更宽" % HOME_WIDTH)
+    ap.add_argument("--setup", action="store_true",
+                    help="开售前摆好窗口：左首页（归你）／右两个商品标签（归脚本），然后退出")
+    ap.add_argument("--test", action="store_true", help="自检后退出")
+    args = ap.parse_args()
+
+    targets = [t for t in TARGETS if args.with_shop or not t.get("optional")]
+
+    if args.setup:
+        setup_windows(targets, args.home_width)
+        return
+
+    print("准备页面……")
+    targets = ensure_tabs(targets, args.windows)
+    if not targets:
+        print("一个页面都没开起来，退出。")
+        return
+
+    if args.windows:
+        order, seen = [], set()
+        for tg in targets:
+            pos = find_tab(tg["match"], tg["exclude"])
+            if pos and pos[0] not in seen:
+                seen.add(pos[0])
+                order.append(pos[0])
+        print("并排摆窗口：" + ("成功" if tile_windows(order) else "读不到屏幕尺寸，跳过"))
+
+    print("\n基准：")
+    base = {}
+    for tg in targets:
+        try:
+            pos = find_tab(tg["match"], tg["exclude"])
+            r, st = None, "OTHER"
+            if pos:
+                # 读两遍取字数大的那次。半成品只会偏小，取大的就不会拿半成品当基准。
+                for _ in range(2):
+                    st2, r2 = probe(*pos)
+                    if r2 and (r is None or r2["chars"] > r["chars"]):
+                        r, st = r2, st2
+            said = False
+        except Exception as e:
+            r, st, said = None, "OTHER", True
+            print("  %-12s 建立基准时出错（%s），跳过，不影响其它页面"
+                  % (tg["label"], type(e).__name__))
+        if r:
+            base[tg["key"]] = {"chars": r["chars"], "had_pending": r["pending"]}
+            print("  %-12s 字数 %6d  商品页=%-5s  待售提示=%-5s  可下单=%-5s  提示音=%s"
+                  % (tg["label"], r["chars"], r["prod"], r["pending"],
+                     r["buy"], tg["sound"]))
+        elif not said:
+            print("  %-12s 读不到（还是会盯着，只是没有基准）" % tg["label"])
+
+    threading.Thread(target=_ring_worker, daemon=True).start()
+    threading.Thread(target=_stdin_worker, daemon=True).start()
+
+    if args.test:
+        print("\n自检：三个提示音依次响一遍，然后置顶 + 通知 + Bark……")
+        for tg in targets:
+            print("  %s → %s" % (tg["label"], tg["sound"]))
+            subprocess.run(["afplay", SOUND_DIR % tg["sound"]], capture_output=True)
+        pos = find_tab(targets[0]["match"], targets[0]["exclude"])
+        if pos:
+            bring_front(*pos)
+        notify("Duo 守夜自检", "这是自检，不是真的开卖")
+        print("Bark：" + ("已发" if push_bark("Duo 守夜自检", "这是自检，不是真的开卖") else "没发出去"))
+        print("三声音色不同、Safari 跳到前面、手机收到推送，就说明没问题。")
+        return
+
+    slow_until = None
+    if args.start:
+        try:
+            hh, mm = [int(x) for x in args.start.split(":")]
+            now = dt.datetime.now()
+            slow_until = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if slow_until < now:
+                slow_until += dt.timedelta(days=1)
+            print("\n待命模式：%s 之前每分钟刷一次，到点自动转全速。"
+                  % slow_until.strftime("%m-%d %H:%M"))
+        except Exception:
+            print("--start 格式应该是 19:58，忽略。")
+            slow_until = None
+
+    print("\n开始。判定「能买了」有两条路：出现「加入购物袋」，或者"
+          "「暂无供应」「机型将在获得批准后发售」全消失（会再刷一次复核）。")
+    print("维护页不算，会一直刷下去。")
+    print("全程只抢一次焦点，之后绝不打断你下单。Ctrl+C 退出。\n")
+
+    hot, noticed = set(), {t["key"]: set() for t in targets}
+    last_pos = {}          # 记住每个目标上次在哪，网址漂走时好把它拉回来
+    deadline = None
+    n = 0
+    try:
+        while True:
+          try:
+            slow = slow_until is not None and dt.datetime.now() < slow_until
+            if slow_until is not None and not slow:
+                print("\n\n>>> 到点了，转全速。\n")
+                slow_until = None
+            n += 1
+            marks = []
+            checked = 0
+            for tg in targets:
+              try:
+                k = tg["key"]
+                if k in hot:
+                    marks.append("%s:已有货(冻结)" % tg["label"])
+                    continue
+                if not slow and n % tg.get("every", 1) != 0:
+                    continue          # 这轮轮不到它
+                checked += 1
+                pos = find_tab(tg["match"], tg["exclude"])
+                if pos:
+                    last_pos[k] = pos
+                else:
+                    # 按网址找不着了。可能是苹果维护时重定向走了，也可能是你自己点进去了。
+                    old_pos = last_pos.get(k)
+                    if not old_pos:
+                        marks.append("%s:窗口没了" % tg["label"])
+                        continue
+                    stray = read_tab(*old_pos)
+                    su = (stray or {}).get("url", "").lower()
+                    if not stray:
+                        marks.append("%s:窗口没了" % tg["label"])
+                        continue
+                    # 别把别的目标的标签页抢过来
+                    if any(t["match"].lower() in su for t in targets if t["key"] != k):
+                        marks.append("%s:窗口没了" % tg["label"])
+                        continue
+                    if any(h in su for h in HANDOVER_HINTS):
+                        marks.append("%s:你已接管,不碰" % tg["label"])
+                        continue
+                    # 网址漂了（维护重定向/报错页），拉回去
+                    osa('tell application "Safari" to set URL of tab %d of window %d to "%s"'
+                        % (old_pos[1], old_pos[0], tg["url"]))
+                    time.sleep(1.0)
+                    pos = find_tab(tg["match"], tg["exclude"]) or old_pos
+                    last_pos[k] = pos
+                    marks.append("%s:网址漂了,已拉回" % tg["label"])
+                reload_tab(*pos)
+                pos = find_tab(tg["match"], tg["exclude"]) or pos
+                state, r = probe(*pos)
+                if r is None:
+                    marks.append("%s:读不到" % tg["label"])
+                    continue
+
+                # 能买了，第一种：商品页上直接出现「加入购物袋」。立刻信。
+                if state == "HIT" and tg["buyable"]:
+                    hot.add(k)          # 冻结，再也不刷它
+                    announce(tg, pos, "能买了——出现「加入购物袋」", True, not args.no_front)
+                    marks.append("%s:已有货(冻结)" % tg["label"])
+                    continue
+
+                # 能买了，第二种：还是商品页，但待售提示全没了。
+                # 这是「消失」型，半成品会冒充，所以再刷一次复核才算数。
+                if (state == "MAYBE" and tg["buyable"]
+                        and base.get(k, {}).get("had_pending")):
+                    reload_tab(*pos)
+                    st2, r2 = probe(*pos)
+                    if st2 in ("HIT", "MAYBE"):
+                        hot.add(k)
+                        announce(tg, pos, "能买了——待售提示全没了（已复核两次）",
+                                 True, not args.no_front)
+                        marks.append("%s:已有货(冻结)" % tg["label"])
+                        continue
+                    marks.append("%s:疑似变化,复核没过" % tg["label"])
+                    continue
+
+                # 到这里就是「还没开卖」：PENDING（待售提示还在）或 OTHER（维护页等）。
+                # 什么都不用等，直接进下一轮马上再刷——这正是你要的「不用等，立刻继续刷」。
+                # 字数比较只在「等到页面稳定」的情况下才有意义。
+                # PENDING 是一看到待售提示就立刻返回的，页面根本没渲染完，
+                # 字数是个半截数（实测在 8316~10813 之间乱跳），拿它比大小必然误判。
+                # 何况对商品页来说，「待售提示还在不在」本来就比字数准得多。
+                b = base.get(k)
+                if state != "PENDING" and b and b["chars"] > 0:
+                    d = abs(r["chars"] - b["chars"]) / float(b["chars"])
+                    if d > 0.15 and "size" not in noticed[k]:
+                        noticed[k].add("size")
+                        announce(tg, pos, "页面变了 %d→%d 字（还不能买，继续刷）"
+                                 % (b["chars"], r["chars"]), False, False)
+                    base[k] = {"chars": r["chars"],
+                               "had_pending": b.get("had_pending", False)}
+
+                if state == "PENDING":
+                    marks.append("%s:待售" % tg["label"])      # 字数是半截的，不显示免得误导
+                else:
+                    tag = {"OTHER": "非商品页", "MAYBE": "疑似"}.get(state, state)
+                    marks.append("%s:%d字/%s" % (tg["label"], r["chars"], tag))
+              except Exception as e:
+                # 一个页面出岔子不能拖垮整晚，记一笔继续跑
+                marks.append("%s:出错(%s)" % (tg["label"], type(e).__name__))
+              if slow:
+                  break
+            sys.stdout.write("\r[%s] 第 %d 轮  %s        "
+                             % (time.strftime("%H:%M:%S"), n, "  ".join(marks)))
+            sys.stdout.flush()
+            if deadline is None and not slow and args.max_minutes > 0:
+                deadline = time.time() + args.max_minutes * 60
+                print("\n（安全闸：%.0f 分钟后自动停，也就是 %s）\n"
+                      % (args.max_minutes,
+                         (dt.datetime.now() + dt.timedelta(minutes=args.max_minutes)).strftime("%H:%M")))
+            if deadline and not slow and time.time() > deadline:
+                stop_ring()
+                print("\n\n到了 --max-minutes 上限，自动停。窗口都留着，你可以手动刷。")
+                return
+            if len(hot) == len([t for t in targets if t["buyable"]]):
+                time.sleep(2.0)     # 该盯的都有货了，别再空转
+            elif checked == 0:
+                time.sleep(0.5)     # 这轮谁都没轮到，别空转烧 CPU
+            else:
+                time.sleep(60.0 if slow else args.interval)
+          except KeyboardInterrupt:
+            raise
+          except Exception as e:
+            print("\n主循环出错（%s: %s），3 秒后继续，不中断。" % (type(e).__name__, e))
+            time.sleep(3.0)
+    except KeyboardInterrupt:
+        stop_ring()
+        print("\n已退出。窗口都留着，你可以手动接着刷。")
+
+
+if __name__ == "__main__":
+    main()

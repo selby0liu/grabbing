@@ -1,0 +1,845 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+10/16 晚上自动刷新 512 白（2026-10-13 定稿：普通 Safari 窗口，已登录，指纹直接结账）
+
+两条线：你用手机 Apple Store App 手刷；这个脚本在 Mac 上替你刷 Safari 里的 512 白。
+手机是另一个会话，Mac 这边被挡也牵连不到手机。
+
+用法：
+    python3 night_watch.py --selftest          只读一次页面 + 响一声，不刷新
+    python3 night_watch.py                     倒计时；北京 19:55 解禁后按 Control+C 开刷，不按 19:59:30 自动开刷
+    python3 night_watch.py --rehearse          演练：拿现在能买的 iPhone 17 走一遍
+    python3 night_watch.py --start now --fast-minutes 30 --slow-minutes 0
+                                               实测用：立刻按当晚节奏刷 30 分钟
+
+按键：
+    Control+C   开刷（解禁后才算数）；暂停中 / 刷到后 = 「不能买，接着刷」
+    Return      任何时候强制关闭，铃声一起停
+    动鼠标/键盘  铃声停（刷到或暂停时）
+
+节奏（北京时间）：
+    19:59:30 之前   一次都不刷（倒计时期间每 30 秒看一眼标签页还在不在）
+    19:59:30–20:10  每 3–5 秒刷一次（随机）
+    20:10–20:30     每 10–15 秒刷一次
+    20:30           自动停
+
+规矩：
+    · 只认地址里含 mk2p4ch 的那一个标签页。开了不止一个就不动手，等你关掉多余的。
+      脚本自己绝不开新窗口（演练模式除外）。
+    · 刷到能买了：不再刷，推到面前撑满屏幕，响铃。误判的话按 Control+C 接着刷。
+    · 认不出的页面：暂停、推到面前、响铃；10 秒没人碰自动接着刷；你一碰就一直等。
+    · 排队页：暂停，永不自动刷。
+    · 跳到 404：不带 cookie 再访问一次分清原因——
+        直连正常 → 等 30 秒再试；连续两次都这样才算被挡 → 停手（再刷只会挡得更久）
+        真打不开 → 深链接失效 → 换去刷购买页，之后每隔一会儿看深链接有没有恢复
+    · 不替你点任何按钮、不填任何信息。
+"""
+
+import argparse
+import os
+import datetime as dt
+import random
+import signal
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import urllib.error
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:          # 3.9 以前没有，兜一个固定 +8
+    ZoneInfo = None
+
+import launch_watch as lw     # 复用实测过的零件：找标签页、读页面、判断、响铃
+
+DEEP_URL = "https://www.apple.com.cn/shop/buy-iphone/iphone-duo/mk2p4ch/a"
+DEEP_MATCH = "mk2p4ch"
+SHOP_URL = "https://www.apple.com.cn/shop/buy-iphone/iphone-duo"
+SHOP_MATCH = "buy-iphone/iphone-duo"
+
+LAUNCH_DAY = dt.date(2026, 10, 16)
+START_BJ = (19, 59, 30)     # 你不动的话，这个时间自动开刷
+UNLOCK_BJ = (19, 55, 0)     # 从这个时间起，按 Control+C 就能立刻开刷
+SOUND_HIT = "Glass"
+SOUND_WARN = "Sosumi"
+SOUND_TIP = "Tink"
+
+# 你自己往下走了（购物袋/结账/登录），脚本撒手
+HANDOVER_HINTS = lw.HANDOVER_HINTS
+
+# 排队页（iPhone 17 首发出现过「请勿关闭此页面」）：一刷新就丢位置，必须停手。
+# 「请稍候」太常见（加载中也会出现），不能放进来，否则会把加载页当排队页永远停住。
+# 2025 年唯一一条原文：「在我们带你进店开始预购前，请勿关闭此页面」。2026 文案可能变，所以多认几种说法。
+# 10/13 实测：Duo 待售页、iPhone 17 在售页、18 Pro 维护日和开售后的存档、真实维护页文字，都不含下面任何一个词。
+QUEUE_WORDS = ["请勿关闭", "不要关闭", "保持此页面", "带你进店", "排队", "队列", "等候", "轮到你", "请耐心等待"]
+
+# 真实维护页（IT之家 2026-09-12 截图）：蓝底 logo +「来得早，来得好。」「即将与你见面。北京时间晚 8 点接受预购。一会儿见。」
+# 认出来就照常接着刷，不管页面多长。「接受预购」正常商品页上也有，不能用。
+MAINT_WORDS = ["来得早", "即将与你见面", "一会儿见"]
+
+AUTO_RESUME_SECONDS = 10
+# 你按 Control+C 放过的「能买了」页面，多久后失效。真开卖的页面可能和误判的过渡页长得差不多（字数在同一档），
+# 永久放过会让真页面也不响；60 秒失效 = 误判页最多一分钟响一次，真页面最晚一分钟内一定响。
+HIT_DISMISS_SECONDS = 60    # 认不出的页面：停 10 秒，你没碰它就自动接着刷（排队页/刷到了 永不自动刷）
+TAB_CHECK_SECONDS = 30      # 倒计时期间每隔多久看一眼标签页
+DEEP_RECHECK_ROUNDS = 6     # 换到购买页之后，每几轮看一次深链接有没有恢复
+
+
+# ---------- 小零件 ----------
+
+def hid_idle_seconds():
+    """距离你上次动鼠标/触控板/键盘过了几秒（macOS 自己记的，不需要任何权限）。读不到返回 None。"""
+    try:
+        out = subprocess.run(["ioreg", "-c", "IOHIDSystem"], capture_output=True, text=True, timeout=3).stdout
+        for line in out.splitlines():
+            if "HIDIdleTime" in line:
+                return int(line.split("=")[-1].strip()) / 1e9
+    except Exception:
+        pass
+    return None
+
+
+def page_fingerprint(pos):
+    """整页文字的指纹。你在页面上点了选项，文字就会变——用来判断你是不是在操作。"""
+    import hashlib
+    t = lw.osa('tell application "Safari" to return (text of tab %d of window id %d) as string'
+               % (pos[1], pos[0]))
+    if not t:
+        return None
+    # 苹果页面会自己冒出又消失的读屏提示（10/13 实测：「图库已更新，」），不算你操作
+    t = "\n".join(l for l in t.splitlines() if "已更新" not in l)
+    return hashlib.md5(t.encode("utf-8")).hexdigest()
+
+
+def page_has_any(pos, words):
+    cond = " or ".join('(s contains "%s")' % w for w in words)
+    out = lw.osa('''
+tell application "Safari"
+  set s to (text of tab %d of window id %d) as string
+  return (%s) as string
+end tell''' % (pos[1], pos[0], cond))
+    if out not in ("true", "false"):
+        return None          # 读页面失败（Safari 忙），不是「没有这些词」
+    return out == "true"
+
+
+def bj_tz():
+    if ZoneInfo:
+        return ZoneInfo("Asia/Shanghai")
+    return dt.timezone(dt.timedelta(hours=8))
+
+
+def now_bj():
+    return dt.datetime.now(bj_tz())
+
+
+def two_clocks(t=None):
+    """同时给出北京和阿德莱德（本机）时间，免得换算出错。"""
+    t = t or now_bj()
+    return "北京 %s / 本机 %s" % (t.strftime("%H:%M:%S"),
+                                 t.astimezone().strftime("%H:%M:%S"))
+
+
+def hms(sec):
+    sec = max(0, int(sec))
+    d, sec = divmod(sec, 86400)
+    h, sec = divmod(sec, 3600)
+    m, sec = divmod(sec, 60)
+    return ("%d 天 " % d if d else "") + "%02d:%02d:%02d" % (h, m, sec)
+
+
+_tty_saved = None
+
+
+def setup_tty():
+    """让按键不用再按回车就能读到（Return 一按就生效）。"""
+    global _tty_saved
+    try:
+        import termios, tty
+        if sys.stdin.isatty():
+            _tty_saved = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin.fileno())
+    except Exception:
+        _tty_saved = None
+
+
+def restore_tty():
+    try:
+        import termios
+        if _tty_saved is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, _tty_saved)
+    except Exception:
+        pass
+
+
+def status(text):
+    """在同一行原地更新。\033[K 清掉行尾残字；文字保持短于 80 列，免得折行后变成一秒一行。"""
+    sys.stdout.write("\r\033[K" + text)
+    sys.stdout.flush()
+
+
+def beep(name):
+    subprocess.Popen(["afplay", lw.SOUND_DIR % name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def find_all(match, exclude=None):
+    """所有地址含 match 的标签页 [(窗口id, 序号, 网址)]。用来发现「开了不止一个」。"""
+    cond = 'u contains "%s"' % match
+    if exclude:
+        cond += ' and u does not contain "%s"' % exclude
+    out = lw.osa('''
+tell application "Safari"
+  set acc to ""
+  repeat with w in windows
+    set ti to 0
+    repeat with t in tabs of w
+      set ti to ti + 1
+      try
+        set u to ((URL of t) as string)
+        if %s then set acc to acc & ((id of w) as string) & "," & (ti as string) & "," & u & linefeed
+      end try
+    end repeat
+  end repeat
+  return acc
+end tell''' % cond)
+    res = []
+    for line in (out or "").splitlines():
+        p = line.split(",", 2)
+        if len(p) == 3:
+            try:
+                res.append((int(p[0]), int(p[1]), p[2]))
+            except ValueError:
+                pass
+    return res
+
+
+def tab_url(pos, tries=1):
+    """读标签页网址。Safari 忙着加载时 AppleScript 会瞬时失败，重要场合多试几次再下结论。"""
+    for i in range(tries):
+        u = lw.osa('tell application "Safari" to return (URL of tab %d of window id %d) as string'
+                   % (pos[1], pos[0]))
+        if u:
+            return u
+        if i + 1 < tries:
+            time.sleep(0.5)
+    return ""
+
+
+def to_front(pos):
+    """推到面前 + 撑满。任何一步失败都不能影响主流程。"""
+    try:
+        lw.maximize_window(pos[0])
+    except Exception:
+        pass
+    try:
+        lw.bring_front(*pos)
+    except Exception:
+        pass
+
+
+def clean_fetch(url):
+    """不带 cookie、不跟 Safari 共享任何东西地访问一次，返回 (结论, 说明)。
+    结论：PRODUCT 商品页正常 / NOTFOUND 真的 404 / MOVED 被跳到别的页（深链接失效时
+    苹果会把它 301 回购买页，2026-10-13 拿假型号实测） / OTHER 别的（维护页、超时等）"""
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 "
+                          "(KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+            "Accept-Language": "zh-CN,zh;q=0.9"})
+        with urllib.request.urlopen(req, timeout=12) as r:
+            final = r.geturl()
+            body = r.read().decode("utf-8", "ignore")
+        if "404" in final:
+            return "NOTFOUND", "跳到了 %s" % final
+        want = url.rstrip("/").rsplit("/shop/", 1)[-1].lower()
+        if want not in final.lower():
+            return "MOVED", "被跳到了 %s" % final
+        if all(m in body for m in lw.PRODUCT_MARKERS):
+            return "PRODUCT", "商品页正常"
+        return "OTHER", "打开了，但不是商品页（%d 字）" % len(body)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return "NOTFOUND", "HTTP 404"
+        return "OTHER", "HTTP %d" % e.code
+    except Exception as e:
+        return "OTHER", type(e).__name__
+
+
+def wait_for_single_tab(match, label):
+    """等到恰好只有一个目标标签页。脚本自己绝不开窗口。"""
+    said = None
+    while True:
+        tabs = find_all(match)
+        if len(tabs) == 1:
+            return tabs[0][:2]
+        msg = ("没找到 %s 的标签页。请在 Safari 里把这个地址粘进去打开：\n    %s"
+               % (label, DEEP_URL)) if not tabs else \
+              ("找到 %d 个 %s 的标签页，我不知道该刷哪个。请只留一个，其它关掉。"
+               % (len(tabs), label))
+        if msg != said:
+            print("\n" + msg)
+            beep(SOUND_WARN)
+            said = msg
+        time.sleep(3)
+
+
+def pace_for(t, fast_end, slow_end):
+    if t < fast_end:
+        return random.uniform(3.0, 5.0), "快"
+    if t < slow_end:
+        return random.uniform(10.0, 15.0), "慢"
+    return None, "停"
+
+
+FRONT = True
+
+
+def notify_hit(pos, headline):
+    """能买了：推到面前 + 撑满 + 响铃。"""
+    print("\n" + "=" * 64)
+    print("★ %s %s   [%s]" % ("星光白 512GB" if DEEP_MATCH == "mk2p4ch" else "【演练】iPhone 17",
+                               headline, two_clocks()))
+    if FRONT:
+        to_front(pos)
+    lw.notify("Duo 开卖了", "星光白 512GB " + headline)
+    lw.start_ring(SOUND_HIT)
+    print("  已停止刷新，窗口推到你面前了。选「不折抵」→ AppleCare 第一个 → 加入购物袋 → 结账。")
+    print("  响铃中：你一动鼠标就停。误判了（其实买不了）→ 按 Control+C 接着刷。要关闭 → Return")
+    print("  按键前先点一下这个终端窗口（或 ⌘Tab 切回来），否则按在 Safari 上没用。")
+
+
+def warn(text, sound=SOUND_WARN, seconds=30):
+    print("\n" + "-" * 64)
+    print("! %s   [%s]" % (text, two_clocks()))
+    lw.notify("Duo 自动刷新", text.split("\n")[0])
+    lw.start_ring(sound, seconds)
+
+
+# ---------- 演练：拿现在就能买的 iPhone 17 页面，把「刷到能买了」整套走一遍 ----------
+
+REHEARSE_URL = "https://www.apple.com.cn/shop/buy-iphone/iphone-17/mg6x4ch/a"
+REHEARSE_MATCH = "mg6x4ch"
+
+
+def _read_tab_iphone17(wid, ti):
+    """和 launch_watch.read_tab 一样，只是「是不是商品页」改认 iPhone 17。"""
+    out = lw.osa('''
+tell application "Safari"
+  set t to tab %d of window id %d
+  set s to (text of t) as string
+  set n to (count of characters of s) as string
+  set b1 to (s contains "加入购物袋") as string
+  set b2 to (s contains "立即购买") as string
+  set g1 to (s contains "暂无供应") as string
+  set g2 to (s contains "机型将在获得批准后发售") as string
+  set p1 to (s contains "iPhone 17") as string
+  return n & "|" & b1 & "|" & b2 & "|" & g1 & "|" & g2 & "|" & p1 & "|" & p1 & "|" & ((URL of t) as string)
+end tell''' % (ti, wid))
+    if not out or "|" not in out:
+        return None
+    f = out.split("|")
+    if len(f) < 8:
+        return None
+    try:
+        n = int(f[0])
+    except Exception:
+        return None
+    return {"chars": n, "buy": (f[1] == "true" or f[2] == "true"),
+            "pending": (f[3] == "true" or f[4] == "true"),
+            "prod": (f[5] == "true" and f[6] == "true"), "url": f[7]}
+
+
+def setup_rehearsal():
+    """把目标换成 iPhone 17，其余代码一行不变——演练走的就是当晚那条路。"""
+    global DEEP_URL, DEEP_MATCH, SHOP_URL, SHOP_MATCH
+    DEEP_URL, DEEP_MATCH = REHEARSE_URL, REHEARSE_MATCH
+    SHOP_URL, SHOP_MATCH = "https://www.apple.com.cn/shop/buy-iphone/iphone-17", "buy-iphone/iphone-17"
+    lw.read_tab = _read_tab_iphone17
+    lw.PRODUCT_MARKERS = ["iPhone 17"]
+    if not find_all(DEEP_MATCH):
+        print("演练：开一个 iPhone 17 的窗口（只在演练时会这样，当晚脚本绝不开窗口）……")
+        lw.osa('tell application "Safari" to make new document with properties {URL:"%s"}' % DEEP_URL)
+        time.sleep(4)
+
+
+def selftest():
+    print("自检：只读页面，不刷新。")
+    tabs = find_all(DEEP_MATCH)
+    print("  找到 %d 个 512 白标签页%s" % (len(tabs), "（正好）" if len(tabs) == 1 else "（应该恰好 1 个）"))
+    for w, t, u in tabs:
+        r = lw.read_tab(w, t)
+        if r:
+            print("  窗口 %d 第 %d 个标签：%d 字  商品页=%s  待售提示=%s  可下单=%s"
+                  % (w, t, r["chars"], r["prod"], r["pending"], r["buy"]))
+    k, why = clean_fetch(DEEP_URL)
+    print("  不带 cookie 访问深链接：%s（%s）" % (k, why))
+    idle = hid_idle_seconds()
+    print("  鼠标键盘空闲时间：%s" % ("读不到（刷到后铃声只能按 Return 停）" if idle is None else "%.1f 秒（正常）" % idle))
+    print("  响一声 %s……" % SOUND_HIT)
+    subprocess.run(["afplay", lw.SOUND_DIR % SOUND_HIT], capture_output=True)
+    lw.notify("Duo 自动刷新自检", "这是自检，不是真的开卖")
+    print("  现在：%s" % two_clocks())
+    print("听到声音、右上角弹了通知，就没问题。")
+
+
+# ---------- 停下来等你（刷到了 / 认不出 / 排队页 共用） ----------
+
+def wait_here(pos, paused, kind):
+    """kind: 'hit' 刷到了 / 'queue' 排队页 / 'unknown' 认不出。
+    返回 'resume'（你按了 Control+C）/ 'auto'（10 秒没动静）/ 'handover'（你点进购物袋/结账了）
+    / 'queue_over'（排队页没了，苹果放你进去了）。
+    只有 'unknown' 会自动接着刷；'hit' 和 'queue' 一直等。你一碰鼠标键盘，铃声就停。"""
+    fp0, fp_prev, same = None, page_fingerprint(pos), 0
+    t_pause = time.time()
+    touched = False
+    last_queue_check = time.time()
+    no_queue = 0
+    while paused.is_set():
+        if any(h in tab_url(pos).lower() for h in HANDOVER_HINTS):
+            lw.stop_ring()
+            return "handover"
+        if kind == "queue" and time.time() - last_queue_check >= 2:
+            last_queue_check = time.time()
+            q = page_has_any(pos, QUEUE_WORDS)
+            if q is False:
+                no_queue += 1
+            elif q is True:
+                no_queue = 0          # 读不到（None）就不算数，等下一次
+            if no_queue >= 2:
+                paused.clear()
+                lw.stop_ring()
+                return "queue_over"
+        left = AUTO_RESUME_SECONDS - (time.time() - t_pause)
+        if not touched:
+            # 暂停之后你动过鼠标/键盘 = 你在操作（哪怕页面卡着没变化），绝不自动刷
+            idle = hid_idle_seconds()
+            if idle is not None and idle + 0.5 < time.time() - t_pause:
+                touched = True
+            fp = page_fingerprint(pos)
+            if fp0 is None:
+                # 基准要等页面自己稳住（连续 3 次一样）才定——刚停下时页面可能还在懒加载
+                same = same + 1 if (fp and fp == fp_prev) else 0
+                if same >= 2:
+                    fp0 = fp
+                fp_prev = fp
+            elif fp and fp != fp0:
+                touched = True            # 稳住之后又变了 = 你在操作页面
+            if touched:
+                lw.stop_ring()            # 你一动，铃就停
+            elif kind == "unknown" and left <= 0:
+                paused.clear()
+                lw.stop_ring()
+                return "auto"
+        if kind == "hit":
+            tip = "能买就买 · 误判了按 Control+C 接着刷 · Return 关闭"
+        elif kind == "queue":
+            tip = "排队页 · 不自动刷 · Return 关闭"
+        elif touched:
+            tip = "你在操作 · 一直等你 · Control+C 继续刷 · Return 关闭"
+        else:
+            tip = "%d 秒后自动接着刷 · Control+C 立刻刷 · Return 关闭" % max(0, int(left + 0.99))
+        status("[%s] 暂停中 · %s" % (time.strftime("%H:%M:%S"), tip))
+        time.sleep(0.5)
+    lw.stop_ring()
+    return "resume"
+
+
+# ---------- 主流程 ----------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--start", default="", help="'now' 立刻开始（实测用）；不填则等 10/16 北京 19:59:30")
+    ap.add_argument("--fast-minutes", type=float, default=10.5)
+    ap.add_argument("--slow-minutes", type=float, default=20.0)
+    ap.add_argument("--no-front", action="store_true", help="刷到了不推到面前（实测用）")
+    ap.add_argument("--rehearse", action="store_true",
+                    help="演练：拿现在能买的 iPhone 17 走一遍「刷到→推到面前→响铃」")
+    args = ap.parse_args()
+    label = "512 白"
+    if args.rehearse:
+        setup_rehearsal()
+        args.start, label = "now", "iPhone 17（演练）"
+
+    if args.selftest:
+        selftest()
+        return
+    global FRONT
+    FRONT = not args.no_front
+
+    threading.Thread(target=lw._ring_worker, daemon=True).start()
+    go_now = threading.Event()
+    paused = threading.Event()
+    started = threading.Event()
+    unlock_at = [None]
+
+    def on_key(ch):
+        # Return = 任何时候强制关闭
+        if ch in ("\r", "\n"):
+            hard_stop()
+            restore_tty()
+            os._exit(0)
+
+    def on_ctrl_c(_sig, _frm):
+        # Control+C = 开刷（19:55 解禁后才算数）。暂停中 / 刷到后 = 接着刷。
+        if started.is_set() and paused.is_set():
+            paused.clear()
+        elif started.is_set():
+            sys.stdout.write("\r\033[K（已经在刷了。要关闭请按 Return）\n")
+        elif unlock_at[0] is not None and now_bj() >= unlock_at[0]:
+            go_now.set()
+        elif unlock_at[0] is not None:
+            sys.stdout.write("\r\033[K（还没到 %s 解禁，Control+C 不算数）\n"
+                             % unlock_at[0].astimezone().strftime("%H:%M"))
+        sys.stdout.flush()
+    signal.signal(signal.SIGINT, on_ctrl_c)
+
+    def stdin_worker():
+        try:
+            if sys.stdin.isatty():
+                while True:
+                    ch = sys.stdin.read(1)
+                    if not ch:
+                        return
+                    on_key(ch)
+            else:                      # 不是终端（测试用管道）：按行读
+                for line in sys.stdin:
+                    on_key(line[:1] if line.strip() else "\n")
+        except Exception:
+            pass
+    setup_tty()
+    threading.Thread(target=stdin_worker, daemon=True).start()
+
+    if args.start == "now":
+        start = now_bj()
+        unlock_at[0] = start
+    else:
+        day = dt.datetime(LAUNCH_DAY.year, LAUNCH_DAY.month, LAUNCH_DAY.day, tzinfo=bj_tz())
+        start = day.replace(hour=START_BJ[0], minute=START_BJ[1], second=START_BJ[2])
+        unlock_at[0] = day.replace(hour=UNLOCK_BJ[0], minute=UNLOCK_BJ[1], second=UNLOCK_BJ[2])
+    # 快/慢/停 的时间点按自动开刷时间算死，提前手动开刷不会让整晚多刷
+    fast_end = start + dt.timedelta(minutes=args.fast_minutes)
+    slow_end = fast_end + dt.timedelta(minutes=args.slow_minutes)
+    if now_bj() >= slow_end:
+        print("已经过了 %s，开售时段结束了，不刷。" % two_clocks(slow_end))
+        return
+
+    print("解禁：  %s   （从这时起按 Control+C 就立刻开刷）" % two_clocks(unlock_at[0]))
+    print("自动开刷：%s   （你不按的话）" % two_clocks(start))
+    print("放慢于：%s" % two_clocks(fast_end))
+    print("自动停：%s" % two_clocks(slow_end))
+    print("开刷：19:55 解禁后按【Control + C】（左下角 control 键，不是 ⌘）")
+    print("强制关闭：任何时候按【Return】\n")
+
+    pos = wait_for_single_tab(DEEP_MATCH, label)
+    print("盯住了：窗口 %d 第 %d 个标签。\n" % pos)
+
+    # ---- 倒计时：一次都不刷；每 30 秒看一眼标签页还在不在、是不是还只有一个 ----
+    # 显示每 0.05 秒更新、带毫秒，每次都现读系统时间（不会越积越慢）；自动开刷误差 < 0.05 秒。
+    # 查标签页放到后台线程，免得 AppleScript 那零点几秒让倒计时卡一下。
+    tab_state = {"pos": pos, "ok": True}
+    countdown_over = threading.Event()
+
+    def tab_watch():
+        while not countdown_over.wait(TAB_CHECK_SECONDS):
+            try:
+                tabs = find_all(DEEP_MATCH)
+            except Exception:
+                continue
+            if countdown_over.is_set():
+                return
+            if len(tabs) == 1:
+                if not tab_state["ok"]:
+                    print("\n标签页回来了：窗口 %d 第 %d 个。" % tabs[0][:2])
+                tab_state["pos"], tab_state["ok"] = tabs[0][:2], True
+            elif tab_state["ok"]:
+                tab_state["ok"] = False
+                beep(SOUND_WARN)
+                print("\n！%s 的标签页%s。开刷前请弄好，否则到点要先等你。地址：\n    %s"
+                      % (label, "不见了" if not tabs else "有 %d 个（应该只有 1 个）" % len(tabs), DEEP_URL))
+    threading.Thread(target=tab_watch, daemon=True).start()
+
+    def hms_ms(sec):
+        sec = max(0.0, sec)
+        ms = int((sec - int(sec)) * 1000)
+        return "%s.%03d" % (hms(int(sec)), ms)
+
+    while not go_now.is_set():
+        t = now_bj()
+        if t >= start:
+            break
+        # 每一行都要短于 80 列（窗口宽度），超了会折行、变回一秒冒一行。最长的「还有几天」那行 70 列。
+        if not tab_state["ok"]:
+            msg = "！标签页不对，见上面提示 · 距开刷 %s" % hms_ms((start - t).total_seconds())
+        elif t < unlock_at[0]:
+            msg = "距解禁 %s · 距自动开刷 %s" % (
+                hms_ms((unlock_at[0] - t).total_seconds()), hms_ms((start - t).total_seconds()))
+        else:
+            msg = "已解禁！Control+C 开刷 · %s 后自动开刷" % hms_ms((start - t).total_seconds())
+        lt = t.astimezone()
+        status("[%s.%03d] %s" % (lt.strftime("%H:%M:%S"), lt.microsecond // 1000, msg))
+        time.sleep(0.05)
+    countdown_over.set()
+    pos = tab_state["pos"]
+    started.set()
+    print("\n\n>>> %s，开始刷。[%s]\n" % ("你按了 Control+C" if go_now.is_set() else "到点了", two_clocks()))
+
+    # ---- 开刷前最后确认标签页。网址只是漂走了（维护重定向之类）就直接拉回来，不等你 ----
+    tabs = find_all(DEEP_MATCH)
+    if len(tabs) == 1:
+        pos = tabs[0][:2]
+    elif not tabs and pos:
+        u = tab_url(pos, tries=3).lower()
+        if "apple.com.cn" in u and not any(h in u for h in HANDOVER_HINTS):
+            print("标签页网址漂到了 %s，拉回深链接。" % u[:60])
+            lw.set_tab_url(pos[0], pos[1], DEEP_URL)
+            time.sleep(1.5)
+        else:
+            pos = wait_for_single_tab(DEEP_MATCH, label)
+    else:
+        pos = wait_for_single_tab(DEEP_MATCH, label)
+
+    target_url, target_match = DEEP_URL, DEEP_MATCH
+    dismissed, last_sig = {}, [None]     # 签名 -> 放过的时间
+
+    def is_dismissed(sig):
+        t_d = dismissed.get(sig)
+        if t_d is None:
+            return False
+        if sig[0] == "hit" and time.time() - t_d > HIT_DISMISS_SECONDS:
+            del dismissed[sig]                # 放过的「能买了」到期了，重新当新页面看
+            return False
+        return True
+    n = 0
+    soft404 = 0          # 连续几次「404 但直连正常」
+    after_queue = 0      # 刚从排队页被放进来：还要「只看不刷」几轮（放行后页面可能还在跳转/加载）
+    unclear = False      # 上一轮读页面失败
+    unclear_streak = 0   # 连续几轮读页面失败（Safari 网页进程卡死时会一直失败，不能无限只看不刷）
+    rounds_on_shop = 0   # 换到购买页之后刷了几轮
+    try:
+        while True:
+            try:
+                t0 = time.time()
+                gap, phase = pace_for(now_bj(), fast_end, slow_end)
+                if gap is None:
+                    print("\n\n到 %s 了，自动停。窗口留着，你可以手动接着刷。" % two_clocks())
+                    lw.notify("Duo 自动刷新", "到点自动停了，电脑这边不再刷。要继续就在 Safari 里手动刷。")
+                    for _ in range(2):
+                        subprocess.run(["afplay", lw.SOUND_DIR % SOUND_WARN], capture_output=True)
+                    return
+
+                navigated = False
+                # 刚被排队页放进来：这一轮不刷新、不改网址（一动可能又回去排队），直接看当前页
+                hold = after_queue > 0
+                if hold:
+                    after_queue -= 1
+                peek, unclear = unclear, False   # 上一轮看不清页面：这一轮也不刷，只再看一次
+                u = tab_url(pos, tries=3).lower()
+                if not u:
+                    # 连读三次都没有：标签页真没了（被关了 / Safari 重开了）。重新找，找不到就提示你打开
+                    print("\n找不到正在刷的那个标签页了，重新找……")
+                    pos = wait_for_single_tab(target_match, label)
+                    print("找到了：窗口 %d 第 %d 个标签。" % pos)
+                    continue
+                if any(h in u for h in HANDOVER_HINTS):
+                    print("\n\n你已经点进购物袋/结账了，脚本撒手不管。")
+                    return
+                if hold or peek:
+                    navigated = True
+                elif "404" in u:
+                    # 只看 Safari 自己：第一次 404 等 30 秒再试，连续两次才算被挡。
+                    # （不再用 Python 直连去复核：它的指纹不是 Safari，而且维护期间它看到的和 Safari 不一样）
+                    soft404 += 1
+                    if soft404 >= 2:
+                        warn("连续两次跳到 404：被苹果挡了（Safari 这个会话），已停止刷新——再刷只会挡得更久。\n"
+                             "  手机那条线不受影响，以手机为主继续刷。\n"
+                             "  Mac 想再开一路：⌘⇧N 开无痕窗口、登录 Apple ID（要输密码），打开 %s 手动刷；"
+                             "或等十几分钟自动解封。" % DEEP_URL, seconds=20)
+                        time.sleep(21)
+                        return
+                    warn("跳到了 404。可能是被挡，也可能只是一时抽风——等 30 秒再试一次。",
+                         sound=SOUND_TIP, seconds=2)
+                    time.sleep(30)
+                    lw.set_tab_url(pos[0], pos[1], target_url)
+                    navigated = True
+                else:
+                    soft404 = 0
+                    if target_match == SHOP_MATCH and DEEP_MATCH in u:
+                        # 在购买页凑合时，上一轮试着设回深链接，这次没被跳走 = 深链接恢复了
+                        print("\n深链接恢复了，换回去刷。")
+                        target_url, target_match = DEEP_URL, DEEP_MATCH
+                    elif target_match == DEEP_MATCH and DEEP_MATCH not in u and SHOP_MATCH in u:
+                        # 深链接被苹果跳回了购买页：不去验证，直接在购买页上刷（购买页上也有判断要用的字）
+                        warn("深链接被跳回了购买页，改刷购买页。每隔几轮会试一次深链接。",
+                             sound=SOUND_TIP, seconds=4)
+                        target_url, target_match = SHOP_URL, SHOP_MATCH
+                        rounds_on_shop = 0
+                    elif target_match not in u:
+                        # 维护重定向之类：拉回来（拉回本身就是一次加载，这轮不再额外刷新）
+                        lw.set_tab_url(pos[0], pos[1], target_url)
+                        navigated = True
+
+                # 在购买页上凑合着刷的时候，每隔几轮用 Safari 自己试一次深链接：设回去，下一轮看有没有被跳走
+                if target_match == SHOP_MATCH and not hold and not navigated:
+                    rounds_on_shop += 1
+                    if rounds_on_shop % DEEP_RECHECK_ROUNDS == 0:
+                        lw.set_tab_url(pos[0], pos[1], DEEP_URL)
+                        navigated = True
+
+                if not navigated:
+                    lw.reload_tab(*pos)
+                n += 1
+                state, r = lw.probe(*pos)
+                if hold and state in ("PENDING", "HIT", "MAYBE"):
+                    after_queue = 0          # 页面已经稳住、看清了，之后照常
+                hit_how = None
+                if state == "HIT":
+                    hit_how = "能买了——出现「加入购物袋」"
+                elif state == "MAYBE" and hold:
+                    hit_how = "能买了——排队放行后待售提示没了"   # 刚排完队，不刷新复核
+                elif state == "MAYBE" and r and not r["buy"] and \
+                        is_dismissed(("hit", r["prod"], round(r["chars"] / 500.0))):
+                    state = "已放过的页面"        # 放过的页面不做复核刷新，省一次请求
+                elif state == "MAYBE":
+                    lw.reload_tab(*pos)
+                    st2, r2 = lw.probe(*pos)
+                    if st2 in ("HIT", "MAYBE"):
+                        hit_how = "能买了——待售提示没了（复核两次）"
+                        r = r2 or r
+                    else:
+                        state = "复核没过"
+
+                # —— 认不出的页面：宁可误报，也绝不在你可能正在下单的页面上继续刷 ——
+                why_pause, kind = None, None
+                last_sig[0] = None
+                q = None if (hit_how or state == "已放过的页面") else page_has_any(pos, QUEUE_WORDS)
+                if q is not None or hit_how or state == "已放过的页面":
+                    unclear_streak = 0
+                if hit_how and r:
+                    # 你按 Control+C 放过的「能买了」页面，同样的页面不再响——除非真出现了「加入购物袋」
+                    hsig = ("hit", r["prod"], round(r["chars"] / 500.0))
+                    if r["buy"] or not is_dismissed(hsig):
+                        kind = "hit"
+                        last_sig[0] = hsig
+                    else:
+                        hit_how, state = None, "已放过的页面"
+                elif hit_how:
+                    kind = "hit"
+                elif state == "已放过的页面":
+                    pass                                 # 上面已认定是放过的页面，不再往下判断
+                elif q is None:
+                    # 读页面失败：可能正好是排队页，刷新就丢位置。这一轮不判断，下一轮不刷新、只再看一次。
+                    # 但连续 2 轮都看不清，多半是页面卡死了——第 3 轮照常刷新，就像人会按 ⌘R 一样。
+                    unclear_streak += 1
+                    unclear = unclear_streak < 2
+                    state = "看不清（读页面失败%s）" % ("，下一轮不刷新" if unclear else "，下一轮照常刷新")
+                elif page_has_any(pos, MAINT_WORDS):
+                    state = "维护页"                     # 还没开卖，照常接着刷
+                elif q:
+                    kind = "queue"
+                    why_pause = "这是排队页。千万别刷新、别关，等它自己放你进去。"
+                elif r and not r["pending"] and r["chars"] >= lw.RENDER_FLOOR:
+                    time.sleep(1.5)                       # 先排除「还没渲染完」
+                    r3 = lw.read_tab(*pos)
+                    hsig3 = r3 and ("hit", r3["prod"], round(r3["chars"] / 500.0))
+                    if r3 and r3["prod"] and r3["buy"]:
+                        kind, hit_how = "hit", "能买了——出现「加入购物袋」"
+                    elif r3 and r3["prod"] and not r3["pending"] and r3["chars"] >= lw.RENDER_FLOOR:
+                        # 还是商品页、待售提示没了 = 就是「能买了」的条件（只是刚才 probe 没等到它稳）
+                        if not is_dismissed(hsig3):
+                            kind, hit_how = "hit", "能买了——待售提示没了（等页面稳住后确认）"
+                            last_sig[0] = hsig3
+                        else:
+                            state = "已放过的页面"
+                    elif r3 and not r3["pending"] and r3["chars"] >= lw.RENDER_FLOOR:
+                        sig = (r3["prod"], round(r3["chars"] / 500.0))
+                        if not is_dismissed(sig):
+                            kind = "unknown"
+                            why_pause = "页面变样了（%d 字，待售提示没了），脚本认不出能不能买。" % r3["chars"]
+                            last_sig[0] = sig
+
+                if kind:
+                    paused.set()
+                    if kind == "hit":
+                        notify_hit(pos, hit_how)
+                    else:
+                        print("\n" + "!" * 64)
+                        print("‖ 已暂停刷新   [%s]" % two_clocks())
+                        print("‖ " + why_pause)
+                        print("‖ 能买 → 直接在 Safari 里买（不折抵 → AppleCare 第一个 → 加入购物袋）")
+                        if kind == "queue":
+                            print("‖ 排队页不会自动刷。进去了直接买；要关闭 → 按 Return")
+                        else:
+                            print("‖ 不能买 → 按 Control+C 立刻继续刷；你不碰它的话 %d 秒后自动接着刷" % AUTO_RESUME_SECONDS)
+                            print("‖ 你动了鼠标/键盘、或页面有变化 → 一直等着，不会刷掉你选的   要关闭 → 按 Return")
+                        print("‖ 按键前先点一下这个终端窗口（或 ⌘Tab 切回来），否则按在 Safari 上没用。")
+                        if FRONT:
+                            to_front(pos)
+                        lw.notify("Duo 已暂停刷新", why_pause)
+                        lw.start_ring(SOUND_WARN, 120)
+                    # 等的时候出意外（Safari 忙、AppleScript 抽风）绝不能掉回主循环去刷新——
+                    # 你可能正在这个页面上选 AppleCare。接着等就是了。
+                    while True:
+                        try:
+                            how = wait_here(pos, paused, kind)
+                            break
+                        except KeyboardInterrupt:
+                            raise
+                        except Exception as e:
+                            print("\n（暂停中出了个意外：%s——继续等你，不刷新）" % type(e).__name__)
+                            time.sleep(1)
+                    if how == "handover":
+                        print("\n你已经点进购物袋/结账了，脚本撒手不管。")
+                        return
+                    if how == "queue_over":
+                        print("\n>>> 排队页没了，苹果放你进来了。马上看这一页能不能买（不刷新）。[%s]" % two_clocks())
+                        after_queue = 3      # 最多 3 轮只看不刷，直到页面稳住
+                        continue
+                    if last_sig[0]:
+                        dismissed[last_sig[0]] = time.time()   # 同样的页面不再为它停（「能买了」60 秒后失效）
+                    print("\n>>> %s继续刷。[%s]" % ("你按了 Control+C，" if how == "resume"
+                                                   else "%d 秒没动静，自动" % AUTO_RESUME_SECONDS, two_clocks()))
+                    continue
+
+                tag = {"PENDING": "待售", "OTHER": "非商品页(维护/转圈)"}.get(state, state)
+                status("[%s] 第 %d 次 · %s · %s节奏%s" % (time.strftime("%H:%M:%S"), n, tag, phase,
+                                                    "" if target_match == DEEP_MATCH else " · 购买页"))
+
+                rest = gap - (time.time() - t0)
+                if rest > 0:
+                    time.sleep(rest)
+
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                # 任何意外都不能让整晚停摆：记一笔，2 秒后接着来
+                print("\n（出了个意外：%s: %s——2 秒后接着刷，不会停）" % (type(e).__name__, e))
+                time.sleep(2)
+                try:
+                    if not tab_url(pos, tries=3):
+                        pos = wait_for_single_tab(target_match, label)
+                except Exception:
+                    pass
+    except KeyboardInterrupt:
+        raise
+
+
+def hard_stop():
+    """Return：任何阶段（倒计时、刷新中、响铃中）立刻全停，连铃声一起掐掉。"""
+    lw.stop_ring()
+    subprocess.run(["pkill", "-x", "afplay"], capture_output=True)
+    print("\n\n■ 已强制关闭。一次都不会再刷。Safari 窗口留着，你可以手动接着刷。")
+
+
+if __name__ == "__main__":
+    # 启动早期（还没装上「Control+C=开刷」之前）按 Control+C 就照常退出
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        main()
+    except KeyboardInterrupt:
+        hard_stop()
+    finally:
+        restore_tty()
